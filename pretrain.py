@@ -84,6 +84,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
 
+
 @dataclass
 class TrainState:
     model: nn.Module
@@ -357,7 +358,7 @@ def eval_override(
     else:
         p_use = 0.05 # P(KeepBatch)
     B = 768 # XXX: Don't hard code
-    L = 3 # XXX: Don't hard code
+    L = train_state.model.model.config.n_latents
     inner = train_state.model.model.inner
     q_head = inner.q_head
     return_keys = set(["preds"])
