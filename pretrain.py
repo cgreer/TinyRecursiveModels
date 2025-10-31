@@ -419,7 +419,7 @@ def eval_override(
             # best_preds = [] # [B x 81]; prediction w/ highest qhat
             for b_i in range(B):
                 qhats = [lat_qs[l_i][b_i, 0] for l_i in range(L * L)]
-                best_lat_idx = np.argmax(qhats.cpu())
+                best_lat_idx = np.argmax(qhats)
 
                 # best_prob = qhats[best_lat_idx]
                 # best_probs.append(best_prob) # XXX: convert to prob
