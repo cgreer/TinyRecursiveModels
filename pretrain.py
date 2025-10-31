@@ -349,6 +349,7 @@ def eval_override(
     train_state: TrainState,
     eval_loader: torch.utils.data.DataLoader,
 ):
+    print("Running override eval")
     import numpy as np
     import random
     p_use = 0.05 # P(KeepBatch)
