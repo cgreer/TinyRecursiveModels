@@ -352,7 +352,10 @@ def eval_override(
     print("Running override eval")
     import numpy as np
     import random
-    p_use = 0.05 # P(KeepBatch)
+    if train_state.step >= 60000: # do all on last eval
+        p_use = 1.0
+    else:
+        p_use = 0.05 # P(KeepBatch)
     B = 768 # XXX: Don't hard code
     L = 3 # XXX: Don't hard code
     inner = train_state.model.model.inner
@@ -360,8 +363,8 @@ def eval_override(
     return_keys = set(["preds"])
 
     total = 0 # total examples evaluated
-    total_correct = 0 # total cells correct
-    total_exact_correct = 0 # total entire boards correct
+    cells_correct = 0 # total cells correct
+    boards_correct = 0 # total entire boards correct
     with torch.inference_mode():
         for set_name, batch, global_batch_size in eval_loader:
 
@@ -375,6 +378,7 @@ def eval_override(
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
             labels = batch["labels"] # B x 81
+            assert labels.shape[0] == B # incomplete batches?
 
             # Get preds, qhats for every latent
             lat_qs = [] # L x B x 2; logits
@@ -423,18 +427,19 @@ def eval_override(
                 best_pred = lat_preds[best_lat_idx][b_i]
                 # best_preds.append(best_pred)
 
-                n_correct = int((best_pred == labels[b_i]).sum(-1))
+                n_correct = int((best_pred == labels[b_i]).sum(-1)) # n cells predicted correctly
+
                 total += 1
-                total_correct += n_correct
+                cells_correct += n_correct
                 if n_correct == 81:
-                    total_exact_correct += 1
+                    boards_correct += 1
 
     # Summarize metrics
     metrics = {
         "eval": {
             "total": total,
-            "acc": total_correct / (total * 81),
-            "exact_acc": total_exact_correct / total,
+            "accuracy": cells_correct / (total * 81),
+            "exact_accuracy": boards_correct / total,
         }
     }
     return metrics
@@ -725,7 +730,7 @@ def launch(hydra_config: DictConfig):
                 train_state_eval = train_state
             train_state_eval.model.eval()
             metrics = eval_override(config, train_state_eval, eval_loader)
-            # metrics = evaluate(config, train_state_eval, eval_loader, eval_metadata, evaluators, rank=RANK, world_size=WORLD_SIZEcpu_group=CPU_PROCESS_GROUP)
+            # metrics = evaluate(config, train_state_eval, eval_loader, eval_metadata, evaluators, rank=RANK, world_size=WORLD_SIZE, cpu_group=CPU_PROCESS_GROUP)
             if RANK == 0 and metrics is not None:
                 print(train_state.step, metrics)
                 wandb.log(metrics, step=train_state.step)

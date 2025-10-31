@@ -43,7 +43,7 @@ class ACTLossHead(nn.Module):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
-        
+
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
 
@@ -69,12 +69,12 @@ class ACTLossHead(nn.Module):
 
             is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
-            
+
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
-                
+
                 "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
