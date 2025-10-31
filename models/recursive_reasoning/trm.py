@@ -54,6 +54,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
 
     # Halting Q-learning config
     halt_max_steps: int
+    halt_eval_steps: int
     halt_exploration_prob: float
 
     forward_dtype: str = "bfloat16"
@@ -63,7 +64,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     # Alexia: added
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
-    no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    no_ACT_continue: bool = True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -308,7 +309,9 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
+
+            max_steps = self.config.halt_max_steps if self.training else self.config.halt_eval_steps
+            is_last_step = new_steps >= max_steps
 
             halted = is_last_step
 
