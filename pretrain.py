@@ -25,6 +25,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
 
+
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -309,15 +310,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
-            
+
     # Apply optimizer
-    lr_this_step = None    
+    lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
-            
+
         optim.step()
         optim.zero_grad()
 
@@ -334,13 +335,105 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if rank == 0:
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
-            
+
             # Postprocess
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
+
+
+def eval_override(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+):
+    import numpy as np
+    import random
+    p_use = 0.05 # P(KeepBatch)
+    B = 768
+    L = 3
+    q_head = train_state.model.inner.q_head
+    return_keys = set(["preds", "logits"])
+
+    total = 0 # total examples evaluated
+    total_correct = 0 # total correct preds
+    with torch.inference_mode():
+        for set_name, batch, global_batch_size in eval_loader:
+
+            # Skip batches to save time
+            if random.random() > p_use:
+                continue
+
+            # To device
+            batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device("cuda"):
+                carry = train_state.model.initial_carry(batch)  # type: ignore
+
+            labels = batch["labels"] # B x 81
+
+            # Get preds, qhats for every latent
+            lat_qs = [] # L x B x 2; logits
+            lat_preds = [] # L x B x 81; prediction for each cell
+            l_i = 0
+            for fzh in range(L):
+                for fzl in range(L):
+                    train_state.model.inner.force_z_H = fzh
+                    train_state.model.inner.force_z_L = fzl
+
+                    # Run inference for batch
+                    inf_step = 0
+                    while True:
+                        carry, loss, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=return_keys)
+                        if all_finish:
+                            break
+                        inf_step += 1
+
+                    # Predict P(solved)
+                    # - Q-head; uses only the first puzzle_emb position
+                    # - q_logits: [B, 2], z_H: [B x 97 x 512]
+                    q_logits = q_head(carry.z_H[:, 0]).to(torch.float32)
+
+                    # Track info for each latent/batch
+                    lat_qs.append(q_logits)
+                    lat_preds[l_i] = preds["preds"] # preds: B x 81
+
+                    # Incr latent idx
+                    l_i += 1
+
+            # Reset forcing latents
+            train_state.model.inner.force_z_H = None
+            train_state.model.inner.force_z_L = None
+
+            # Get best pred for each batch instance
+            # best_probs = [] # [B x 1]; best q_hat prediction/logit
+            # best_preds = [] # [B x 81]; prediction w/ highest qhat
+            corrects = [] # [B]; is best prediction correct or not
+            for b_i in range(B):
+                qhats = [lat_qs[l_i][b_i, 0] for l_i in range(L * L)]
+                best_lat_idx = np.argmax(qhats)
+
+                # best_prob = qhats[best_lat_idx]
+                # best_probs.append(best_prob) # XXX: convert to prob
+
+                best_pred = lat_preds[best_lat_idx][b_i]
+                # best_preds.append(best_pred)
+
+                corrects.append(best_pred == labels[b_i])
+
+            total += B
+            total_correct += sum(corrects)
+
+    # Summarize metrics
+    metrics = {
+        "eval": {
+            "total": total,
+            "acc": total_correct / total,
+        }
+    }
+    return metrics
+
 
 def evaluate(
     config: PretrainConfig,
@@ -353,7 +446,6 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
 ):
     reduced_metrics = None
-
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
@@ -370,12 +462,12 @@ def evaluate(
 
         carry = None
         processed_batches = 0
-        
+
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
-            
+
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
@@ -457,11 +549,11 @@ def evaluate(
         # Run evaluators
         if rank == 0:
             print(f"\nRunning {len(evaluators)} evaluator(s)...")
-            
+
         for i, evaluator in enumerate(evaluators):
             if rank == 0:
                 print(f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}")
-                
+
             # Path for saving
             evaluator_save_path = None
             if config.checkpoint_path is not None:
@@ -479,7 +571,7 @@ def evaluate(
 
                 reduced_metrics.update(metrics)
                 print(f"  Completed {evaluator.__class__.__name__}")
-                
+
         if rank == 0:
             print("All evaluators completed!")
 
@@ -547,7 +639,7 @@ def launch(hydra_config: DictConfig):
         WORLD_SIZE = dist.get_world_size()
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        
+
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
         assert (
@@ -623,18 +715,11 @@ def launch(hydra_config: DictConfig):
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
-                evaluators,
-                rank=RANK, 
-                world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
-
+            metrics = eval_override(config, train_state_eval, eval_loader)
+            # metrics = evaluate(config, train_state_eval, eval_loader, eval_metadata, evaluators, rank=RANK, world_size=WORLD_SIZEcpu_group=CPU_PROCESS_GROUP)
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
-                
+
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
