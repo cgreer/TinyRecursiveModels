@@ -353,13 +353,15 @@ def eval_override(
     import numpy as np
     import random
     p_use = 0.05 # P(KeepBatch)
-    B = 768
-    L = 3
-    q_head = train_state.model.inner.q_head
-    return_keys = set(["preds", "logits"])
+    B = 768 # XXX: Don't hard code
+    L = 3 # XXX: Don't hard code
+    inner = train_state.model.model.inner
+    q_head = inner.q_head
+    return_keys = set(["preds"])
 
     total = 0 # total examples evaluated
-    total_correct = 0 # total correct preds
+    total_correct = 0 # total cells correct
+    total_exact_correct = 0 # total entire boards correct
     with torch.inference_mode():
         for set_name, batch, global_batch_size in eval_loader:
 
@@ -380,8 +382,8 @@ def eval_override(
             l_i = 0
             for fzh in range(L):
                 for fzl in range(L):
-                    train_state.model.inner.force_z_H = fzh
-                    train_state.model.inner.force_z_L = fzl
+                    inner.force_z_H = fzh
+                    inner.force_z_L = fzl
 
                     # Run inference for batch
                     inf_step = 0
@@ -394,26 +396,26 @@ def eval_override(
                     # Predict P(solved)
                     # - Q-head; uses only the first puzzle_emb position
                     # - q_logits: [B, 2], z_H: [B x 97 x 512]
-                    q_logits = q_head(carry.z_H[:, 0]).to(torch.float32)
+                    q_logits = q_head(carry.inner_carry.z_H[:, 0]).to(torch.float32)
 
                     # Track info for each latent/batch
-                    lat_qs.append(q_logits)
-                    lat_preds[l_i] = preds["preds"] # preds: B x 81
+                    lat_qs.append(q_logits.cpu())
+                    lat_preds.append(preds["preds"]) # preds: B x 81
 
                     # Incr latent idx
                     l_i += 1
 
             # Reset forcing latents
-            train_state.model.inner.force_z_H = None
-            train_state.model.inner.force_z_L = None
+            inner.force_z_H = None
+            inner.force_z_L = None
+            assert inner.force_z_H is None
 
             # Get best pred for each batch instance
             # best_probs = [] # [B x 1]; best q_hat prediction/logit
             # best_preds = [] # [B x 81]; prediction w/ highest qhat
-            corrects = [] # [B]; is best prediction correct or not
             for b_i in range(B):
                 qhats = [lat_qs[l_i][b_i, 0] for l_i in range(L * L)]
-                best_lat_idx = np.argmax(qhats)
+                best_lat_idx = np.argmax(qhats.cpu())
 
                 # best_prob = qhats[best_lat_idx]
                 # best_probs.append(best_prob) # XXX: convert to prob
@@ -421,16 +423,18 @@ def eval_override(
                 best_pred = lat_preds[best_lat_idx][b_i]
                 # best_preds.append(best_pred)
 
-                corrects.append(best_pred == labels[b_i])
-
-            total += B
-            total_correct += sum(corrects)
+                n_correct = int((best_pred == labels[b_i]).sum(-1))
+                total += 1
+                total_correct += n_correct
+                if n_correct == 81:
+                    total_exact_correct += 1
 
     # Summarize metrics
     metrics = {
         "eval": {
             "total": total,
-            "acc": total_correct / total,
+            "acc": total_correct / (total * 81),
+            "exact_acc": total_exact_correct / total,
         }
     }
     return metrics
@@ -627,6 +631,8 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
+    import random
+
     RANK = 0
     WORLD_SIZE = 1
     CPU_PROCESS_GROUP = None
@@ -700,6 +706,8 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
+                if random.random() < 0.01:
+                    print(train_state.step, metrics)
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
@@ -719,6 +727,7 @@ def launch(hydra_config: DictConfig):
             metrics = eval_override(config, train_state_eval, eval_loader)
             # metrics = evaluate(config, train_state_eval, eval_loader, eval_metadata, evaluators, rank=RANK, world_size=WORLD_SIZEcpu_group=CPU_PROCESS_GROUP)
             if RANK == 0 and metrics is not None:
+                print(train_state.step, metrics)
                 wandb.log(metrics, step=train_state.step)
 
             ############ Checkpointing
