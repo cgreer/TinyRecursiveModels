@@ -446,6 +446,92 @@ def eval_override(
     return metrics
 
 
+def last_v_max_eval(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+):
+    print("Running override eval")
+    import random
+    p_use = 0.02
+    B = 768 # XXX: Don't hard code
+    inner = train_state.model.model.inner
+    q_head = inner.q_head
+    return_keys = set(["preds"])
+
+    total = 0 # total examples evaluated
+
+    best_cells_correct = 0 # total cells correct
+    best_boards_correct = 0 # total entire boards correct
+
+    final_cells_correct = 0 # total cells correct
+    final_boards_correct = 0 # total entire boards correct
+    with torch.inference_mode():
+
+        inner.force_z_H = None
+        inner.force_z_L = None
+        assert inner.force_z_H is None
+
+        for set_name, batch, global_batch_size in eval_loader:
+
+            # Skip batches to save time
+            if random.random() > p_use:
+                continue
+
+            # To device
+            batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device("cuda"):
+                carry = train_state.model.initial_carry(batch)  # type: ignore
+
+            labels = batch["labels"] # B x 81
+            assert labels.shape[0] == B # incomplete batches?
+
+            # Run inference for batch
+            best_info = [(None, None)] * B # B x (q, pred)
+            while True:
+                carry, loss, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=return_keys)
+
+                # Get this steps qhat, preds
+                step_qs = q_head(carry.inner_carry.z_H[:, 0]).to(torch.float32).cpu() # B x 2; halt/continue logits
+                step_preds = preds["preds"] # B x 81
+                for b_i in range(B):
+                    best_q = best_info[b_i][0]
+                    if (best_q is None) or (step_qs[b_i][0] >= best_q):
+                        best_info[b_i] = (step_qs[b_i][0], step_preds[b_i])
+
+                if all_finish:
+                    break
+
+            # Get max step's pred
+            final_preds = step_preds # B x 81
+
+            # Tabulate accuracies
+            for b_i in range(B):
+                total += 1
+
+                n_correct = int((final_preds[b_i] == labels[b_i]).sum(-1)) # n cells predicted correctly
+                final_cells_correct += n_correct
+                if n_correct == 81:
+                    final_boards_correct += 1
+
+                n_correct = int((best_info[b_i][1] == labels[b_i]).sum(-1)) # n cells predicted correctly
+                best_cells_correct += n_correct
+                if n_correct == 81:
+                    best_boards_correct += 1
+
+    # Summarize metrics
+    metrics = {
+        "eval": {
+            "total": total,
+            "final_accuracy": final_cells_correct / (total * 81),
+            "final_exact_accuracy": final_boards_correct / total,
+            "best_accuracy": best_cells_correct / (total * 81),
+            "best_exact_accuracy": best_boards_correct / total,
+        }
+    }
+    return metrics
+
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -718,6 +804,19 @@ def launch(hydra_config: DictConfig):
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
+
+            # Last analysis
+            if config.ema:
+                print("SWITCH TO EMA")
+                train_state_eval = copy.deepcopy(train_state)
+                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+            else:
+                train_state_eval = train_state
+            train_state_eval.model.eval()
+            metrics = last_v_max_eval(config, train_state_eval, eval_loader)
+            print(train_state.step, metrics)
+            wandb.log(metrics, step=train_state.step)
+            import sys; sys.exit(1)
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation

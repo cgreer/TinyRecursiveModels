@@ -5,7 +5,7 @@ loss:
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
-halt_eval_steps: 64
+halt_eval_steps: 256
 
 H_cycles: 3
 L_cycles: 6
