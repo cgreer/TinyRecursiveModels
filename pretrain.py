@@ -25,6 +25,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
 
+
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -82,6 +83,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+
 
 @dataclass
 class TrainState:
@@ -309,15 +311,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
-            
+
     # Apply optimizer
-    lr_this_step = None    
+    lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
-            
+
         optim.step()
         optim.zero_grad()
 
@@ -334,13 +336,201 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if rank == 0:
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
-            
+
             # Postprocess
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
+
+
+def eval_override(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+):
+    print("Running override eval")
+    import numpy as np
+    import random
+    if train_state.step >= 60000: # do all on last eval
+        p_use = 1.0
+    else:
+        p_use = 0.05 # P(KeepBatch)
+    B = 768 # XXX: Don't hard code
+    L = train_state.model.model.config.n_latents
+    inner = train_state.model.model.inner
+    q_head = inner.q_head
+    return_keys = set(["preds"])
+
+    total = 0 # total examples evaluated
+    cells_correct = 0 # total cells correct
+    boards_correct = 0 # total entire boards correct
+    with torch.inference_mode():
+        for set_name, batch, global_batch_size in eval_loader:
+
+            # Skip batches to save time
+            if random.random() > p_use:
+                continue
+
+            # To device
+            batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device("cuda"):
+                carry = train_state.model.initial_carry(batch)  # type: ignore
+
+            labels = batch["labels"] # B x 81
+            assert labels.shape[0] == B # incomplete batches?
+
+            # Get preds, qhats for every latent
+            lat_qs = [] # L x B x 2; logits
+            lat_preds = [] # L x B x 81; prediction for each cell
+            l_i = 0
+            for fzh in range(L):
+                for fzl in range(L):
+                    inner.force_z_H = fzh
+                    inner.force_z_L = fzl
+
+                    # Run inference for batch
+                    inf_step = 0
+                    while True:
+                        carry, loss, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=return_keys)
+                        if all_finish:
+                            break
+                        inf_step += 1
+
+                    # Predict P(solved)
+                    # - Q-head; uses only the first puzzle_emb position
+                    # - q_logits: [B, 2], z_H: [B x 97 x 512]
+                    q_logits = q_head(carry.inner_carry.z_H[:, 0]).to(torch.float32)
+
+                    # Track info for each latent/batch
+                    lat_qs.append(q_logits.cpu())
+                    lat_preds.append(preds["preds"]) # preds: B x 81
+
+                    # Incr latent idx
+                    l_i += 1
+
+            # Reset forcing latents
+            inner.force_z_H = None
+            inner.force_z_L = None
+            assert inner.force_z_H is None
+
+            # Get best pred for each batch instance
+            # best_probs = [] # [B x 1]; best q_hat prediction/logit
+            # best_preds = [] # [B x 81]; prediction w/ highest qhat
+            for b_i in range(B):
+                qhats = [lat_qs[l_i][b_i, 0] for l_i in range(L * L)]
+                best_lat_idx = np.argmax(qhats)
+
+                # best_prob = qhats[best_lat_idx]
+                # best_probs.append(best_prob) # XXX: convert to prob
+
+                best_pred = lat_preds[best_lat_idx][b_i]
+                # best_preds.append(best_pred)
+
+                n_correct = int((best_pred == labels[b_i]).sum(-1)) # n cells predicted correctly
+
+                total += 1
+                cells_correct += n_correct
+                if n_correct == 81:
+                    boards_correct += 1
+
+    # Summarize metrics
+    metrics = {
+        "eval": {
+            "total": total,
+            "accuracy": cells_correct / (total * 81),
+            "exact_accuracy": boards_correct / total,
+        }
+    }
+    return metrics
+
+
+def last_v_max_eval(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: torch.utils.data.DataLoader,
+):
+    print("Running last analysis")
+    import random
+    p_use = 0.05
+    B = 768 # XXX: Don't hard code
+    inner = train_state.model.model.inner
+    q_head = inner.q_head
+    return_keys = set(["preds"])
+
+    total = 0 # total examples evaluated
+
+    best_cells_correct = 0 # total cells correct
+    best_boards_correct = 0 # total entire boards correct
+
+    final_cells_correct = 0 # total cells correct
+    final_boards_correct = 0 # total entire boards correct
+    with torch.inference_mode():
+
+        inner.force_z_H = None
+        inner.force_z_L = None
+        assert inner.force_z_H is None
+
+        for set_name, batch, global_batch_size in eval_loader:
+
+            # Skip batches to save time
+            if random.random() > p_use:
+                continue
+
+            # To device
+            batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device("cuda"):
+                carry = train_state.model.initial_carry(batch)  # type: ignore
+
+            labels = batch["labels"] # B x 81
+            assert labels.shape[0] == B # incomplete batches?
+
+            # Run inference for batch
+            best_info = [(None, None)] * B # B x (q, pred)
+            while True:
+                carry, loss, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=return_keys)
+
+                # Get this steps qhat, preds
+                step_qs = q_head(carry.inner_carry.z_H[:, 0]).to(torch.float32).cpu() # B x 2; halt/continue logits
+                step_preds = preds["preds"] # B x 81
+                for b_i in range(B):
+                    best_q = best_info[b_i][0]
+                    if (best_q is None) or (step_qs[b_i][0] >= best_q):
+                        best_info[b_i] = (step_qs[b_i][0], step_preds[b_i])
+
+                if all_finish:
+                    break
+
+            # Get max step's pred
+            final_preds = step_preds # B x 81
+
+            # Tabulate accuracies
+            for b_i in range(B):
+                total += 1
+
+                n_correct = int((final_preds[b_i] == labels[b_i]).sum(-1)) # n cells predicted correctly
+                final_cells_correct += n_correct
+                if n_correct == 81:
+                    final_boards_correct += 1
+
+                n_correct = int((best_info[b_i][1] == labels[b_i]).sum(-1)) # n cells predicted correctly
+                best_cells_correct += n_correct
+                if n_correct == 81:
+                    best_boards_correct += 1
+
+    # Summarize metrics
+    metrics = {
+        "eval": {
+            "total": total,
+            "final_accuracy": final_cells_correct / (total * 81),
+            "final_exact_accuracy": final_boards_correct / total,
+            "best_accuracy": best_cells_correct / (total * 81),
+            "best_exact_accuracy": best_boards_correct / total,
+        }
+    }
+    return metrics
+
 
 def evaluate(
     config: PretrainConfig,
@@ -353,7 +543,6 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
 ):
     reduced_metrics = None
-
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
@@ -370,12 +559,12 @@ def evaluate(
 
         carry = None
         processed_batches = 0
-        
+
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
-            
+
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
@@ -457,11 +646,11 @@ def evaluate(
         # Run evaluators
         if rank == 0:
             print(f"\nRunning {len(evaluators)} evaluator(s)...")
-            
+
         for i, evaluator in enumerate(evaluators):
             if rank == 0:
                 print(f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}")
-                
+
             # Path for saving
             evaluator_save_path = None
             if config.checkpoint_path is not None:
@@ -479,7 +668,7 @@ def evaluate(
 
                 reduced_metrics.update(metrics)
                 print(f"  Completed {evaluator.__class__.__name__}")
-                
+
         if rank == 0:
             print("All evaluators completed!")
 
@@ -534,6 +723,8 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
+    import random
+
     RANK = 0
     WORLD_SIZE = 1
     CPU_PROCESS_GROUP = None
@@ -547,7 +738,7 @@ def launch(hydra_config: DictConfig):
         WORLD_SIZE = dist.get_world_size()
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        
+
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
         assert (
@@ -607,10 +798,25 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
+                if random.random() < 0.01:
+                    print(train_state.step, metrics)
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
+
+            # Last analysis
+            if config.ema:
+                print("SWITCH TO EMA")
+                train_state_eval = copy.deepcopy(train_state)
+                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+            else:
+                train_state_eval = train_state
+            train_state_eval.model.eval()
+            metrics = last_v_max_eval(config, train_state_eval, eval_loader)
+            print(train_state.step, metrics)
+            wandb.log(metrics, step=train_state.step)
+            import sys; sys.exit(1)
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
@@ -623,18 +829,12 @@ def launch(hydra_config: DictConfig):
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
-                evaluators,
-                rank=RANK, 
-                world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
-
+            metrics = eval_override(config, train_state_eval, eval_loader)
+            # metrics = evaluate(config, train_state_eval, eval_loader, eval_metadata, evaluators, rank=RANK, world_size=WORLD_SIZE, cpu_group=CPU_PROCESS_GROUP)
             if RANK == 0 and metrics is not None:
+                print(train_state.step, metrics)
                 wandb.log(metrics, step=train_state.step)
-                
+
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
