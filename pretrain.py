@@ -25,7 +25,6 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
 
-
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -99,7 +98,7 @@ class TrainState:
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     dataset = PuzzleDataset(PuzzleDatasetConfig(
         seed=config.seed,
-        dataset_paths=config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths,
+        dataset_paths=config.data_paths_test if len(config.data_paths_test) > 0 and split == "test" else config.data_paths,
         rank=rank,
         num_replicas=world_size,
         **kwargs
@@ -193,6 +192,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     return model, optimizers, optimizer_lrs
 
+
 def mix_weights_direct(device, alpha, net, nets):
     sd = []
     for i in range(len(nets)):
@@ -200,11 +200,12 @@ def mix_weights_direct(device, alpha, net, nets):
     sd_alpha = {}
     for k in sd[0].keys():
         comb_net = alpha[0]*sd[0][k].to(device)
-        for i in range(1,len(nets)):
+        for i in range(1, len(nets)):
             comb_net += alpha[i]*sd[i][k].to(device)
-        sd_alpha[k] =  comb_net
+        sd_alpha[k] = comb_net
     net.load_state_dict(sd_alpha)
     return net
+
 
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
@@ -274,9 +275,8 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     )
 
 
-
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
-    data_paths =config.data_paths_test if len(config.data_paths_test)>0 else config.data_paths
+    data_paths = config.data_paths_test if len(config.data_paths_test) > 0 else config.data_paths
     # Initialize evaluators
     evaluators = []
     for cfg in config.evaluators:
@@ -287,6 +287,7 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
             evaluators.append(cls)
 
     return evaluators
+
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
@@ -674,6 +675,7 @@ def evaluate(
 
     return reduced_metrics
 
+
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
         return
@@ -721,6 +723,23 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     return objects[0]  # type: ignore
 
 
+def lerp(a, b, t):
+    return a + (b - a)*t
+
+
+def update_exploration(step, config):
+    frac_s = 0.75
+    total_steps = 65000
+    initial_value = 0.10
+    frac = step / total_steps
+    if frac <= frac_s:
+        return # starts at initial value
+    t = (frac - frac_s) / (1.0 - frac_s)
+    new_val = lerp(initial_value, 1.0, t)
+    print("changing explore:", config.halt_exploration_prob, new_val)
+    config.halt_exploration_prob = new_val
+
+
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
     import random
@@ -760,15 +779,15 @@ def launch(hydra_config: DictConfig):
     train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
     try:
         eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    except:
+    except: # noqa
         print("NO EVAL DATA FOUND")
         eval_loader = eval_metadata = None
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
-    except:
+    except: # noqa
         print("No evaluator found")
-        evaluators = []
+        evaluators = [] # noqa
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
@@ -788,24 +807,27 @@ def launch(hydra_config: DictConfig):
 
     # Training Loop
     for _iter_id in range(total_iters):
-        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
+        print(f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
-        ############ Train Iter
+        # ########### Train Iter
         if RANK == 0:
             print("TRAIN")
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
+            # Update exploration pct
+            update_exploration(train_state.step, config)
+
             if RANK == 0 and metrics is not None:
-                if random.random() < 0.01:
-                    print(train_state.step, metrics)
+                if random.random() < 0.01: print(train_state.step, metrics) # noqa
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
 
             # Last analysis
+            '''
             if config.ema:
                 print("SWITCH TO EMA")
                 train_state_eval = copy.deepcopy(train_state)
@@ -817,9 +839,10 @@ def launch(hydra_config: DictConfig):
             print(train_state.step, metrics)
             wandb.log(metrics, step=train_state.step)
             import sys; sys.exit(1)
+            '''
 
         if _iter_id >= config.min_eval_interval:
-            ############ Evaluation
+            # ########### Evaluation
             if RANK == 0:
                 print("EVALUATE")
             if config.ema:
@@ -835,7 +858,7 @@ def launch(hydra_config: DictConfig):
                 print(train_state.step, metrics)
                 wandb.log(metrics, step=train_state.step)
 
-            ############ Checkpointing
+            # ########### Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
