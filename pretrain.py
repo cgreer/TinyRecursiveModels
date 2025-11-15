@@ -821,7 +821,7 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             # Update exploration pct
-            update_exploration(train_state.step, config)
+            # update_exploration(train_state.step, config)
 
             if RANK == 0 and metrics is not None:
                 if random.random() < 0.01: print(train_state.step, metrics) # noqa
