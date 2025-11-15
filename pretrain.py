@@ -724,11 +724,15 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
 
 
 def lerp(a, b, t):
+    t = min(t, 1.0)
+    t = max(t, 0.0)
     return a + (b - a)*t
 
 
-def update_exploration(step, config):
-    frac_s = 0.75
+def update_exploration(train_state):
+    config = train_state.model.model.config
+    step = train_state.step
+    frac_s = 0.75 # starting fraction of steps
     total_steps = 65000
     initial_value = 0.10
     frac = step / total_steps
